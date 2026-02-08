@@ -549,6 +549,127 @@ async function queryClaude(
 }
 
 // ---------------------------------------------------------------------------
+// Fallback model lists (used when dynamic discovery fails)
+// ---------------------------------------------------------------------------
+
+const CODEX_FALLBACK_MODELS: Array<{ id: string; name: string }> = [
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
+  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
+];
+
+const GEMINI_FALLBACK_MODELS: Array<{ id: string; name: string }> = [
+  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+  { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite" },
+  { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
+];
+
+const CLAUDE_FALLBACK_MODELS: Array<{ id: string; name: string }> = [
+  { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
+  { id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5" },
+  { id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5" },
+  { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
+  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
+  { id: "claude-3-haiku-20240307", name: "Claude 3 Haiku" },
+];
+
+// ---------------------------------------------------------------------------
+// Dynamic model discovery
+// ---------------------------------------------------------------------------
+
+function formatModelName(slug: string): string {
+  return slug
+    .split("-")
+    .map((w) => {
+      if (w === "gpt") return "GPT";
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    })
+    .join(" ");
+}
+
+/** Read Codex models from ~/.codex/models_cache.json (written by Codex CLI). */
+function discoverCodexModels(): Array<{ id: string; name: string }> {
+  try {
+    const raw = readFileSync(
+      join(homedir(), ".codex", "models_cache.json"),
+      "utf-8"
+    );
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data.models)) return CODEX_FALLBACK_MODELS;
+    const models = data.models
+      .filter((m: Record<string, unknown>) => m.visibility === "list")
+      .map((m: Record<string, unknown>) => ({
+        id: m.slug as string,
+        name: formatModelName(m.slug as string),
+      }));
+    if (models.length > 0) {
+      logger.info(`Codex: discovered ${models.length} models from cache`);
+      return models;
+    }
+    return CODEX_FALLBACK_MODELS;
+  } catch {
+    return CODEX_FALLBACK_MODELS;
+  }
+}
+
+/** Fetch available models from Cloud Code Assist. May include Claude models. */
+async function discoverGeminiModels(token: string): Promise<{
+  geminiModels: Array<{ id: string; name: string }>;
+  claudeViaGemini: Array<{ id: string; name: string }>;
+}> {
+  const fallback = { geminiModels: GEMINI_FALLBACK_MODELS, claudeViaGemini: [] };
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const res = await fetch(
+      "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "google-api-nodejs-client/9.15.1",
+          "X-Goog-Api-Client": "gl-node/22.17.0",
+        },
+        body: "{}",
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) return fallback;
+
+    const data = (await res.json()) as Record<string, unknown>;
+    const models = data.models as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(models) || models.length === 0) return fallback;
+
+    const geminiModels: Array<{ id: string; name: string }> = [];
+    const claudeViaGemini: Array<{ id: string; name: string }> = [];
+
+    for (const m of models) {
+      const id = m.name as string;
+      if (!id) continue;
+      const entry = { id, name: formatModelName(id) };
+      if (id.startsWith("claude-")) {
+        claudeViaGemini.push(entry);
+      } else {
+        geminiModels.push(entry);
+      }
+    }
+
+    logger.info(
+      `Gemini: discovered ${geminiModels.length} Gemini + ${claudeViaGemini.length} Claude models from Cloud Code Assist`
+    );
+    return {
+      geminiModels: geminiModels.length > 0 ? geminiModels : GEMINI_FALLBACK_MODELS,
+      claudeViaGemini,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Backend definitions
 // ---------------------------------------------------------------------------
 
@@ -563,7 +684,7 @@ interface SubBackend {
     prompt: string,
     options?: QueryOptions
   ) => Promise<QueryResponse>;
-  models: Array<{ id: string; name: string }>;
+  models: Array<{ id: string; name: string }>; // Populated during detect()
 }
 
 const CLAUDE_BACKEND: SubBackend = {
@@ -572,10 +693,7 @@ const CLAUDE_BACKEND: SubBackend = {
   readTokens: readClaudeTokens,
   refreshTokens: refreshClaudeToken,
   query: queryClaude,
-  models: [
-    { id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5" },
-    { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
-  ],
+  models: [],
 };
 
 const GEMINI_BACKEND: SubBackend = {
@@ -584,11 +702,7 @@ const GEMINI_BACKEND: SubBackend = {
   readTokens: readGeminiTokens,
   refreshTokens: refreshGeminiToken,
   query: queryGemini,
-  models: [
-    { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
-    { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
-    { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
-  ],
+  models: [],
 };
 
 const CODEX_BACKEND: SubBackend = {
@@ -597,14 +711,8 @@ const CODEX_BACKEND: SubBackend = {
   readTokens: readCodexTokens,
   refreshTokens: refreshCodexToken,
   query: queryCodex,
-  models: [
-    { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
-    { id: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
-    { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
-  ],
+  models: [],
 };
-
-const ALL_BACKENDS: SubBackend[] = [CLAUDE_BACKEND, GEMINI_BACKEND, CODEX_BACKEND];
 
 // ---------------------------------------------------------------------------
 // SubscriptionProvider
@@ -617,19 +725,67 @@ export class SubscriptionProvider implements Provider {
   private tokenCache = new Map<string, OAuthTokens>();
 
   async detect(): Promise<number> {
-    for (const backend of ALL_BACKENDS) {
-      const tokens = backend.readTokens();
-      if (tokens) {
-        this.backends.push(backend);
-        this.tokenCache.set(backend.id, tokens);
-        for (const model of backend.models) {
-          this.modelToBackend.set(model.id, backend);
+    // --- Gemini: dynamic discovery via fetchAvailableModels ---
+    const geminiTokens = readGeminiTokens();
+    let claudeViaGeminiModels: Array<{ id: string; name: string }> = [];
+
+    if (geminiTokens) {
+      const { geminiModels, claudeViaGemini } = await discoverGeminiModels(
+        geminiTokens.accessToken
+      );
+      GEMINI_BACKEND.models = geminiModels;
+      claudeViaGeminiModels = claudeViaGemini;
+
+      // Register Claude models served through Cloud Code Assist (direct HTTP, faster than CLI)
+      for (const model of claudeViaGeminiModels) {
+        GEMINI_BACKEND.models.push(model);
+      }
+
+      this.backends.push(GEMINI_BACKEND);
+      this.tokenCache.set(GEMINI_BACKEND.id, geminiTokens);
+      for (const model of GEMINI_BACKEND.models) {
+        this.modelToBackend.set(model.id, GEMINI_BACKEND);
+      }
+      logger.info(
+        `Subscription: ${GEMINI_BACKEND.displayName} — ${geminiModels.length} Gemini` +
+          (claudeViaGeminiModels.length > 0
+            ? ` + ${claudeViaGeminiModels.length} Claude via Cloud Code Assist`
+            : "")
+      );
+    }
+
+    // --- Codex: dynamic discovery from ~/.codex/models_cache.json ---
+    const codexTokens = readCodexTokens();
+    if (codexTokens) {
+      CODEX_BACKEND.models = discoverCodexModels();
+      this.backends.push(CODEX_BACKEND);
+      this.tokenCache.set(CODEX_BACKEND.id, codexTokens);
+      for (const model of CODEX_BACKEND.models) {
+        this.modelToBackend.set(model.id, CODEX_BACKEND);
+      }
+      logger.info(
+        `Subscription: ${CODEX_BACKEND.displayName} — ${CODEX_BACKEND.models.length} models`
+      );
+    }
+
+    // --- Claude: expanded hardcoded list, skip models already available via Gemini ---
+    const claudeTokens = readClaudeTokens();
+    if (claudeTokens) {
+      CLAUDE_BACKEND.models = CLAUDE_FALLBACK_MODELS.filter(
+        (m) => !this.modelToBackend.has(m.id)
+      );
+      if (CLAUDE_BACKEND.models.length > 0) {
+        this.backends.push(CLAUDE_BACKEND);
+        this.tokenCache.set(CLAUDE_BACKEND.id, claudeTokens);
+        for (const model of CLAUDE_BACKEND.models) {
+          this.modelToBackend.set(model.id, CLAUDE_BACKEND);
         }
         logger.info(
-          `Subscription: ${backend.displayName} detected (token on disk)`
+          `Subscription: ${CLAUDE_BACKEND.displayName} — ${CLAUDE_BACKEND.models.length} models (CLI fallback)`
         );
       }
     }
+
     return this.backends.length;
   }
 
