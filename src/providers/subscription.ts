@@ -511,7 +511,7 @@ async function queryClaude(
     "-p", "-", // Read prompt from stdin
     "--model", model,
   ];
-  if (options?.max_tokens) args.push("--max-tokens", String(options.max_tokens));
+  // Note: Claude CLI does not support --max-tokens flag
 
   const result = await execCLI("claude", args, prompt, 120_000);
 
