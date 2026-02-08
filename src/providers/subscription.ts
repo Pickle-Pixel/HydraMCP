@@ -2,32 +2,42 @@
  * Subscription Provider — use your monthly subscriptions as an API.
  *
  * Reads OAuth tokens stored by CLI tools (Claude Code, Gemini CLI, Codex CLI)
- * and makes direct HTTP requests to provider APIs. No subprocess spawning.
+ * and makes direct HTTP requests to provider-internal APIs.
  *
  * Token locations:
  *   Claude  → ~/.claude/.credentials.json
  *   Gemini  → ~/.gemini/oauth_creds.json
  *   Codex   → ~/.codex/auth.json
  *
+ * Endpoints (from CLIProxyAPI & Gemini CLI source):
+ *   Gemini  → https://cloudcode-pa.googleapis.com/v1internal:generateContent
+ *   Codex   → https://chatgpt.com/backend-api/codex/responses (SSE)
+ *   Claude  → CLI subprocess (api.anthropic.com rejects OAuth without TLS fingerprint)
+ *
  * Approach learned from CLIProxyAPI (github.com/router-for-me/CLIProxyAPI).
- * 100% our code. Zero external dependencies.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { spawn } from "node:child_process";
 import { Provider, ModelInfo, QueryOptions, QueryResponse } from "./provider.js";
 import { logger } from "../utils/logger.js";
 
 // ---------------------------------------------------------------------------
-// Token file readers
+// Token types
 // ---------------------------------------------------------------------------
 
 interface OAuthTokens {
   accessToken: string;
   refreshToken: string;
   expiresAt: number; // epoch ms
+  accountId?: string; // Codex: ChatGPT account ID for request header
 }
+
+// ---------------------------------------------------------------------------
+// Token file readers
+// ---------------------------------------------------------------------------
 
 function readClaudeTokens(): OAuthTokens | null {
   try {
@@ -66,18 +76,18 @@ function readCodexTokens(): OAuthTokens | null {
     const data = JSON.parse(raw);
     const tokens = data.tokens;
     if (!tokens?.access_token || !tokens?.refresh_token) return null;
-    // Codex access_token is a JWT — extract exp from payload
     let expiresAt = 0;
     try {
       const payload = JSON.parse(
         Buffer.from(tokens.access_token.split(".")[1], "base64").toString()
       );
-      if (payload.exp) expiresAt = payload.exp * 1000; // sec → ms
-    } catch { /* non-JWT or malformed — treat as no expiry */ }
+      if (payload.exp) expiresAt = payload.exp * 1000;
+    } catch { /* non-JWT or malformed */ }
     return {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       expiresAt,
+      accountId: tokens.account_id ?? undefined,
     };
   } catch {
     return null;
@@ -106,7 +116,6 @@ async function refreshClaudeToken(refreshToken: string): Promise<OAuthTokens | n
     const expiresIn = (data.expires_in as number) ?? 86400;
     if (!accessToken) return null;
 
-    // Write back to credentials file
     try {
       const credPath = join(homedir(), ".claude", ".credentials.json");
       const existing = JSON.parse(readFileSync(credPath, "utf-8"));
@@ -114,7 +123,7 @@ async function refreshClaudeToken(refreshToken: string): Promise<OAuthTokens | n
       existing.claudeAiOauth.refreshToken = newRefresh || refreshToken;
       existing.claudeAiOauth.expiresAt = Date.now() + expiresIn * 1000;
       writeFileSync(credPath, JSON.stringify(existing), "utf-8");
-    } catch { /* non-fatal — token still works for this session */ }
+    } catch { /* non-fatal */ }
 
     return {
       accessToken,
@@ -145,7 +154,6 @@ async function refreshGeminiToken(refreshToken: string): Promise<OAuthTokens | n
     const expiresIn = (data.expires_in as number) ?? 3600;
     if (!accessToken) return null;
 
-    // Write back
     try {
       const credPath = join(homedir(), ".gemini", "oauth_creds.json");
       const existing = JSON.parse(readFileSync(credPath, "utf-8"));
@@ -157,7 +165,7 @@ async function refreshGeminiToken(refreshToken: string): Promise<OAuthTokens | n
 
     return {
       accessToken,
-      refreshToken, // Google doesn't rotate refresh tokens
+      refreshToken,
       expiresAt: Date.now() + expiresIn * 1000,
     };
   } catch {
@@ -185,10 +193,11 @@ async function refreshCodexToken(refreshToken: string): Promise<OAuthTokens | nu
     const expiresIn = (data.expires_in as number) ?? 864000;
     if (!accessToken) return null;
 
-    // Write back
+    let accountId: string | undefined;
     try {
       const credPath = join(homedir(), ".codex", "auth.json");
       const existing = JSON.parse(readFileSync(credPath, "utf-8"));
+      accountId = existing.tokens?.account_id;
       existing.tokens.access_token = accessToken;
       existing.tokens.refresh_token = newRefresh || refreshToken;
       if (data.id_token) existing.tokens.id_token = data.id_token;
@@ -200,10 +209,343 @@ async function refreshCodexToken(refreshToken: string): Promise<OAuthTokens | nu
       accessToken,
       refreshToken: newRefresh || refreshToken,
       expiresAt: Date.now() + expiresIn * 1000,
+      accountId,
     };
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Gemini project ID — resolved via Cloud Code Assist loadCodeAssist API
+// ---------------------------------------------------------------------------
+
+let cachedGeminiProjectId: string | null = null;
+
+async function getGeminiProjectId(token: string): Promise<string> {
+  if (cachedGeminiProjectId) return cachedGeminiProjectId;
+
+  const res = await fetch(
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "google-api-nodejs-client/9.15.1",
+        "X-Goog-Api-Client": "gl-node/22.17.0",
+      },
+      body: JSON.stringify({
+        metadata: {
+          ideType: "IDE_UNSPECIFIED",
+          platform: "PLATFORM_UNSPECIFIED",
+          pluginType: "GEMINI",
+        },
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini loadCodeAssist failed (${res.status}): ${err}`);
+  }
+
+  const data = (await res.json()) as Record<string, unknown>;
+  let projectId: string | null = null;
+
+  if (typeof data.cloudaicompanionProject === "string") {
+    projectId = data.cloudaicompanionProject;
+  } else if (
+    data.cloudaicompanionProject &&
+    typeof data.cloudaicompanionProject === "object" &&
+    typeof (data.cloudaicompanionProject as Record<string, unknown>).id === "string"
+  ) {
+    projectId = (data.cloudaicompanionProject as Record<string, unknown>).id as string;
+  }
+  if (!projectId && Array.isArray(data.allowedTiers)) {
+    const defaultTier = (data.allowedTiers as Array<Record<string, unknown>>).find(
+      (t) => t.isDefault === true
+    );
+    if (typeof defaultTier?.id === "string") {
+      projectId = defaultTier.id as string;
+    }
+  }
+
+  if (!projectId) {
+    throw new Error(
+      "Gemini: no project ID from loadCodeAssist. Run `gemini` CLI once to set up your account."
+    );
+  }
+
+  cachedGeminiProjectId = projectId;
+  logger.info(`Gemini project ID resolved: ${projectId}`);
+  return projectId;
+}
+
+// ---------------------------------------------------------------------------
+// Query: Codex — chatgpt.com/backend-api/codex SSE streaming
+// ---------------------------------------------------------------------------
+
+async function queryCodex(
+  tokens: OAuthTokens,
+  model: string,
+  prompt: string,
+  options?: QueryOptions
+): Promise<QueryResponse> {
+  const startTime = Date.now();
+
+  const input: unknown[] = [];
+  if (options?.system_prompt) {
+    input.push({ role: "developer", content: options.system_prompt });
+  }
+  input.push({ role: "user", content: prompt });
+
+  const body: Record<string, unknown> = {
+    model,
+    instructions: "",
+    input,
+    stream: true,
+    store: false,
+  };
+  if (options?.temperature !== undefined) body.temperature = options.temperature;
+  if (options?.max_tokens !== undefined) body.max_output_tokens = options.max_tokens;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${tokens.accessToken}`,
+    "Accept": "text/event-stream",
+    "Version": "0.98.0",
+    "Openai-Beta": "responses=experimental",
+    "User-Agent": "codex_cli_rs/0.98.0",
+    "Originator": "codex_cli_rs",
+    "Connection": "Keep-Alive",
+  };
+  if (tokens.accountId) {
+    headers["Chatgpt-Account-Id"] = tokens.accountId;
+  }
+
+  const res = await fetch(
+    "https://chatgpt.com/backend-api/codex/responses",
+    { method: "POST", headers, body: JSON.stringify(body) }
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Codex subscription query failed (${res.status}): ${err}`);
+  }
+
+  // Parse SSE stream — look for response.completed event
+  const text = await res.text();
+  const lines = text.split("\n");
+  let content = "";
+  let usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number } | undefined;
+  let finishReason: string | undefined;
+
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue;
+    try {
+      const event = JSON.parse(line.slice(6));
+      if (event.type === "response.output_text.done") {
+        content += event.text ?? "";
+      } else if (event.type === "response.completed") {
+        const resp = event.response;
+        if (resp?.usage) usage = resp.usage;
+        finishReason = resp?.status;
+        // Also extract content from completed response if not yet captured
+        if (!content && resp?.output) {
+          for (const item of resp.output) {
+            if (item.type === "message" && item.content) {
+              for (const block of item.content) {
+                if (block.type === "output_text") content += block.text ?? "";
+              }
+            }
+          }
+        }
+      }
+    } catch { /* skip non-JSON lines */ }
+  }
+
+  return {
+    model,
+    content,
+    usage: usage
+      ? {
+          prompt_tokens: usage.input_tokens ?? 0,
+          completion_tokens: usage.output_tokens ?? 0,
+          total_tokens: usage.total_tokens ?? 0,
+        }
+      : undefined,
+    latency_ms: Date.now() - startTime,
+    finish_reason: finishReason,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Query: Gemini — Cloud Code Assist direct HTTP
+// ---------------------------------------------------------------------------
+
+async function queryGemini(
+  tokens: OAuthTokens,
+  model: string,
+  prompt: string,
+  options?: QueryOptions
+): Promise<QueryResponse> {
+  const startTime = Date.now();
+
+  const projectId = await getGeminiProjectId(tokens.accessToken);
+
+  const request: Record<string, unknown> = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+  };
+  if (options?.system_prompt) {
+    request.systemInstruction = { parts: [{ text: options.system_prompt }] };
+  }
+  const genConfig: Record<string, unknown> = {};
+  if (options?.temperature !== undefined) genConfig.temperature = options.temperature;
+  if (options?.max_tokens !== undefined) genConfig.maxOutputTokens = options.max_tokens;
+  if (Object.keys(genConfig).length > 0) request.generationConfig = genConfig;
+
+  const body = { model, project: projectId, request };
+
+  const res = await fetch(
+    "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": `Bearer ${tokens.accessToken}`,
+        "User-Agent": "google-api-nodejs-client/9.15.1",
+        "X-Goog-Api-Client": "gl-node/22.17.0",
+        "Client-Metadata":
+          "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+      },
+      body: JSON.stringify(body),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini subscription query failed (${res.status}): ${err}`);
+  }
+
+  // Cloud Code Assist wraps the standard Gemini response in a "response" field
+  const data = (await res.json()) as Record<string, unknown>;
+  const inner = (data.response ?? data) as Record<string, unknown>;
+
+  const candidates = inner.candidates as Array<Record<string, unknown>> | undefined;
+  const parts = (candidates?.[0]?.content as Record<string, unknown>)?.parts as
+    | Array<{ text?: string }>
+    | undefined;
+  const content = parts?.map((p) => p.text ?? "").join("") ?? "";
+  const meta = inner.usageMetadata as Record<string, number> | undefined;
+
+  return {
+    model,
+    content,
+    usage: meta
+      ? {
+          prompt_tokens: meta.promptTokenCount ?? 0,
+          completion_tokens: meta.candidatesTokenCount ?? 0,
+          total_tokens: meta.totalTokenCount ?? 0,
+        }
+      : undefined,
+    latency_ms: Date.now() - startTime,
+    finish_reason: (candidates?.[0]?.finishReason as string) ?? undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Query: Claude — CLI subprocess (api.anthropic.com requires TLS fingerprint
+// bypass for OAuth tokens, which needs Go's utls library. Node.js can't do it
+// natively, so we use the Claude CLI as a subprocess.)
+// ---------------------------------------------------------------------------
+
+function execCLI(
+  command: string,
+  args: string[],
+  stdinData?: string,
+  timeoutMs = 120_000
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolve) => {
+    const isWin = process.platform === "win32";
+    const proc = spawn(command, args, {
+      shell: isWin,
+      env: { ...process.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      proc.kill();
+      resolve({ stdout, stderr: stderr + "\n[TIMEOUT]", code: 124 });
+    }, timeoutMs);
+
+    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ stdout, stderr, code: code ?? 1 });
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ stdout, stderr: err.message, code: 1 });
+    });
+
+    if (stdinData && proc.stdin) {
+      proc.stdin.write(stdinData);
+      proc.stdin.end();
+    }
+  });
+}
+
+async function queryClaude(
+  _tokens: OAuthTokens,
+  model: string,
+  prompt: string,
+  options?: QueryOptions
+): Promise<QueryResponse> {
+  const startTime = Date.now();
+
+  const args = [
+    "--output-format", "json",
+    "-p", "-", // Read prompt from stdin
+    "--model", model,
+  ];
+  if (options?.max_tokens) args.push("--max-tokens", String(options.max_tokens));
+
+  const result = await execCLI("claude", args, prompt, 120_000);
+
+  if (result.code !== 0) {
+    throw new Error(
+      `Claude CLI failed (code ${result.code}): ${result.stderr.substring(0, 200)}`
+    );
+  }
+
+  // Parse JSON output from claude --output-format json
+  let content = "";
+  try {
+    const data = JSON.parse(result.stdout);
+    if (typeof data.result === "string") {
+      content = data.result;
+    } else if (typeof data.content === "string") {
+      content = data.content;
+    } else if (Array.isArray(data.content)) {
+      content = data.content
+        .filter((b: Record<string, unknown>) => b.type === "text")
+        .map((b: Record<string, unknown>) => b.text ?? "")
+        .join("");
+    } else {
+      content = result.stdout;
+    }
+  } catch {
+    content = result.stdout;
+  }
+
+  return {
+    model,
+    content,
+    latency_ms: Date.now() - startTime,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -215,156 +557,22 @@ interface SubBackend {
   displayName: string;
   readTokens: () => OAuthTokens | null;
   refreshTokens: (refreshToken: string) => Promise<OAuthTokens | null>;
-  query: (token: string, model: string, prompt: string, options?: QueryOptions) => Promise<QueryResponse>;
+  query: (
+    tokens: OAuthTokens,
+    model: string,
+    prompt: string,
+    options?: QueryOptions
+  ) => Promise<QueryResponse>;
   models: Array<{ id: string; name: string }>;
 }
-
-async function queryOpenAI(
-  token: string, model: string, prompt: string, options?: QueryOptions
-): Promise<QueryResponse> {
-  const startTime = Date.now();
-  const body: Record<string, unknown> = {
-    model,
-    messages: [
-      ...(options?.system_prompt ? [{ role: "system", content: options.system_prompt }] : []),
-      { role: "user", content: prompt },
-    ],
-    stream: false,
-  };
-  if (options?.temperature !== undefined) body.temperature = options.temperature;
-  if (options?.max_tokens !== undefined) body.max_tokens = options.max_tokens;
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenAI subscription query failed (${res.status}): ${err}`);
-  }
-  const data = (await res.json()) as Record<string, unknown>;
-  const choices = data.choices as Array<Record<string, unknown>> | undefined;
-  const choice = choices?.[0];
-  const message = choice?.message as Record<string, unknown> | undefined;
-  const usage = data.usage as { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined;
-
-  return {
-    model,
-    content: (message?.content as string) ?? "",
-    usage,
-    latency_ms: Date.now() - startTime,
-    finish_reason: (choice?.finish_reason as string) ?? undefined,
-  };
-}
-
-async function queryGemini(
-  token: string, model: string, prompt: string, options?: QueryOptions
-): Promise<QueryResponse> {
-  const startTime = Date.now();
-  const body: Record<string, unknown> = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-  };
-  if (options?.system_prompt) {
-    body.systemInstruction = { parts: [{ text: options.system_prompt }] };
-  }
-  const genConfig: Record<string, unknown> = {};
-  if (options?.temperature !== undefined) genConfig.temperature = options.temperature;
-  if (options?.max_tokens !== undefined) genConfig.maxOutputTokens = options.max_tokens;
-  if (Object.keys(genConfig).length > 0) body.generationConfig = genConfig;
-
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`,
-      },
-      body: JSON.stringify(body),
-    }
-  );
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini subscription query failed (${res.status}): ${err}`);
-  }
-  const data = (await res.json()) as Record<string, unknown>;
-  const candidates = data.candidates as Array<Record<string, unknown>> | undefined;
-  const parts = (candidates?.[0]?.content as Record<string, unknown>)?.parts as Array<{ text?: string }> | undefined;
-  const content = parts?.map((p) => p.text ?? "").join("") ?? "";
-  const meta = data.usageMetadata as Record<string, number> | undefined;
-
-  return {
-    model,
-    content,
-    usage: meta ? {
-      prompt_tokens: meta.promptTokenCount ?? 0,
-      completion_tokens: meta.candidatesTokenCount ?? 0,
-      total_tokens: meta.totalTokenCount ?? 0,
-    } : undefined,
-    latency_ms: Date.now() - startTime,
-    finish_reason: (candidates?.[0]?.finishReason as string) ?? undefined,
-  };
-}
-
-async function queryAnthropic(
-  token: string, model: string, prompt: string, options?: QueryOptions
-): Promise<QueryResponse> {
-  const startTime = Date.now();
-  const body: Record<string, unknown> = {
-    model,
-    max_tokens: options?.max_tokens ?? 4096,
-    messages: [{ role: "user", content: prompt }],
-  };
-  if (options?.system_prompt) body.system = options.system_prompt;
-  if (options?.temperature !== undefined) body.temperature = options.temperature;
-
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Anthropic subscription query failed (${res.status}): ${err}`);
-  }
-  const data = (await res.json()) as Record<string, unknown>;
-  const contentBlocks = data.content as Array<{ type: string; text?: string }> | undefined;
-  const text = contentBlocks?.filter((b) => b.type === "text").map((b) => b.text ?? "").join("") ?? "";
-  const usage = data.usage as { input_tokens: number; output_tokens: number } | undefined;
-
-  return {
-    model,
-    content: text,
-    usage: usage ? {
-      prompt_tokens: usage.input_tokens,
-      completion_tokens: usage.output_tokens,
-      total_tokens: usage.input_tokens + usage.output_tokens,
-    } : undefined,
-    latency_ms: Date.now() - startTime,
-    finish_reason: (data.stop_reason as string) ?? undefined,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Backend configs
-// ---------------------------------------------------------------------------
 
 const CLAUDE_BACKEND: SubBackend = {
   id: "claude-sub",
   displayName: "Claude (subscription)",
   readTokens: readClaudeTokens,
   refreshTokens: refreshClaudeToken,
-  query: queryAnthropic,
+  query: queryClaude,
   models: [
-    { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
     { id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5" },
     { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
   ],
@@ -388,11 +596,11 @@ const CODEX_BACKEND: SubBackend = {
   displayName: "Codex (subscription)",
   readTokens: readCodexTokens,
   refreshTokens: refreshCodexToken,
-  query: queryOpenAI,
+  query: queryCodex,
   models: [
-    { id: "gpt-4o", name: "GPT-4o" },
-    { id: "o3", name: "o3" },
-    { id: "o4-mini", name: "o4-mini" },
+    { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
+    { id: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
+    { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
   ],
 };
 
@@ -408,10 +616,6 @@ export class SubscriptionProvider implements Provider {
   private modelToBackend = new Map<string, SubBackend>();
   private tokenCache = new Map<string, OAuthTokens>();
 
-  /**
-   * Detect which subscription tokens exist on disk.
-   * Returns the number of backends with valid tokens.
-   */
   async detect(): Promise<number> {
     for (const backend of ALL_BACKENDS) {
       const tokens = backend.readTokens();
@@ -421,7 +625,9 @@ export class SubscriptionProvider implements Provider {
         for (const model of backend.models) {
           this.modelToBackend.set(model.id, backend);
         }
-        logger.info(`Subscription: ${backend.displayName} detected (token on disk)`);
+        logger.info(
+          `Subscription: ${backend.displayName} detected (token on disk)`
+        );
       }
     }
     return this.backends.length;
@@ -448,14 +654,13 @@ export class SubscriptionProvider implements Provider {
   ): Promise<QueryResponse> {
     const backend = this.modelToBackend.get(model);
     if (!backend) {
-      // Partial match fallback
       const match = this.backends.find((b) =>
         b.models.some((m) => model.includes(m.id) || m.id.includes(model))
       );
       if (!match) {
         throw new Error(
           `No subscription handles model "${model}". ` +
-          `Available: ${[...this.modelToBackend.keys()].join(", ")}`
+            `Available: ${[...this.modelToBackend.keys()].join(", ")}`
         );
       }
       return this.runQuery(match, model, prompt, options);
@@ -485,10 +690,12 @@ export class SubscriptionProvider implements Provider {
         tokens = refreshed;
         this.tokenCache.set(backend.id, tokens);
       } else {
-        logger.warn(`Subscription: ${backend.displayName} token refresh failed, trying existing token`);
+        logger.warn(
+          `Subscription: ${backend.displayName} token refresh failed, trying existing token`
+        );
       }
     }
 
-    return backend.query(tokens.accessToken, model, prompt, options);
+    return backend.query(tokens, model, prompt, options);
   }
 }
