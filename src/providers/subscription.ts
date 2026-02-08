@@ -307,8 +307,8 @@ async function queryCodex(
     stream: true,
     store: false,
   };
-  if (options?.temperature !== undefined) body.temperature = options.temperature;
-  if (options?.max_tokens !== undefined) body.max_output_tokens = options.max_tokens;
+  // Note: chatgpt.com/backend-api/codex does NOT support temperature or
+  // max_output_tokens for Codex reasoning models. Omitting these params.
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
