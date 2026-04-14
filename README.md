@@ -128,7 +128,15 @@ Install [Ollama](https://ollama.com), pull a model, done. Auto-detected.
 ollama pull qwen2.5-coder:14b
 ```
 
-Or run [LM Studio](https://lmstudio.ai), load a model, and start its server. Auto-detected on `localhost:1234`. Point at a different host with:
+Or run [LM Studio](https://lmstudio.ai), load a model, and start its server. Auto-detected on `localhost:1234`. If LM Studio is on another machine, point HydraMCP at it. Either pass it to Claude Code when registering the server:
+
+```bash
+claude mcp add hydramcp \
+  -e LMSTUDIO_URL=http://192.168.40.10:1234 \
+  -- npx hydramcp
+```
+
+Or set it in your shell / `~/.hydramcp/.env` before starting HydraMCP:
 
 ```bash
 LMSTUDIO_URL=http://192.168.40.10:1234
