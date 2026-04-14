@@ -63,11 +63,32 @@ export class LMStudioProvider implements Provider {
     return h;
   }
 
+  /**
+   * Fetch with a hard timeout so a dead/unreachable LM Studio can't stall
+   * tool calls. list_models waits on this inside Promise.allSettled alongside
+   * other providers, so we want it to fail fast.
+   */
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number
+  ): Promise<Response> {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async healthCheck(): Promise<boolean> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/v1/models`, {
-        headers: this.headers(),
-      });
+      const res = await this.fetchWithTimeout(
+        `${this.baseUrl}/api/v1/models`,
+        { headers: this.headers() },
+        3_000
+      );
       return res.ok;
     } catch {
       return false;
@@ -75,9 +96,11 @@ export class LMStudioProvider implements Provider {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    const res = await fetch(`${this.baseUrl}/api/v1/models`, {
-      headers: this.headers(),
-    });
+    const res = await this.fetchWithTimeout(
+      `${this.baseUrl}/api/v1/models`,
+      { headers: this.headers() },
+      3_000
+    );
     if (!res.ok) {
       throw new Error(`LM Studio: failed to list models (${res.status})`);
     }

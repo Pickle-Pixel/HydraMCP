@@ -86,18 +86,20 @@ async function main() {
   }
 
   // --- Local models ---
+  //
+  // Register unconditionally. Local servers (Ollama, LM Studio) can start or
+  // restart independently of the MCP process, so we don't gate registration
+  // on a one-shot boot-time health check — that used to silently drop a
+  // provider for the life of the process if it happened to be down during
+  // startup. Instead, listModels/query reach out live on each tool call
+  // (backed by the 30s model-list cache), and listModels uses
+  // Promise.allSettled so unreachable providers just contribute no models.
 
-  const ollama = new OllamaProvider();
-  if (await ollama.healthCheck()) {
-    multi.register("ollama", ollama);
-    active.push("Ollama");
-  }
+  multi.register("ollama", new OllamaProvider());
+  active.push("Ollama");
 
-  const lmstudio = new LMStudioProvider();
-  if (await lmstudio.healthCheck()) {
-    multi.register("lmstudio", lmstudio);
-    active.push("LM Studio");
-  }
+  multi.register("lmstudio", new LMStudioProvider());
+  active.push("LM Studio");
 
   // --- Startup summary ---
 
