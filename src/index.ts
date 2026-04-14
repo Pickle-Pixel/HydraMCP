@@ -17,6 +17,7 @@
  *
  *   Local models:
  *     OLLAMA_URL           → Ollama local models (auto-detected)
+ *     LMSTUDIO_URL         → LM Studio (defaults to http://localhost:1234)
  *
  * Set any combination. HydraMCP registers what's available.
  *
@@ -27,6 +28,7 @@
  *   "sub/gemini-2.5-flash"    → Gemini CLI subscription
  *   "sub/claude-..."          → Claude CLI subscription
  *   "ollama/llama3"           → local Ollama instance
+ *   "lmstudio/<model>"        → local/LAN LM Studio instance
  *   "gpt-4o"                  → auto-detect (tries each provider)
  */
 
@@ -36,6 +38,7 @@ import { GoogleProvider } from "./providers/google.js";
 import { AnthropicProvider } from "./providers/anthropic.js";
 import { SubscriptionProvider } from "./providers/subscription.js";
 import { OllamaProvider } from "./providers/ollama.js";
+import { LMStudioProvider } from "./providers/lmstudio.js";
 import { MultiProvider } from "./providers/multi-provider.js";
 import { SmartProvider } from "./orchestrator/index.js";
 import { createServer } from "./server.js";
@@ -83,12 +86,20 @@ async function main() {
   }
 
   // --- Local models ---
+  //
+  // Register unconditionally. Local servers (Ollama, LM Studio) can start or
+  // restart independently of the MCP process, so we don't gate registration
+  // on a one-shot boot-time health check — that used to silently drop a
+  // provider for the life of the process if it happened to be down during
+  // startup. Instead, listModels/query reach out live on each tool call
+  // (backed by the 30s model-list cache), and listModels uses
+  // Promise.allSettled so unreachable providers just contribute no models.
 
-  const ollama = new OllamaProvider();
-  if (await ollama.healthCheck()) {
-    multi.register("ollama", ollama);
-    active.push("Ollama");
-  }
+  multi.register("ollama", new OllamaProvider());
+  active.push("Ollama");
+
+  multi.register("lmstudio", new LMStudioProvider());
+  active.push("LM Studio");
 
   // --- Startup summary ---
 
@@ -108,6 +119,7 @@ async function main() {
         "\n" +
         "  Local models:\n" +
         "    Install Ollama → ollama pull llama3\n" +
+        "    LM Studio      → LMSTUDIO_URL=http://host:1234 (default: localhost:1234)\n" +
         "\n" +
         "HydraMCP will start anyway and retry on first request."
     );
