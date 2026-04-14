@@ -89,6 +89,7 @@ Claude Code
     |-- Anthropic  -> api.anthropic.com (API key)
     |-- Sub        -> CLI tools (Gemini CLI, Claude Code, Codex CLI)
     |-- Ollama     -> local models (your hardware)
+    |-- LM Studio  -> local or LAN LM Studio server
 ```
 
 ## Three Ways to Connect Models
@@ -127,6 +128,12 @@ Install [Ollama](https://ollama.com), pull a model, done. Auto-detected.
 ollama pull qwen2.5-coder:14b
 ```
 
+Or run [LM Studio](https://lmstudio.ai), load a model, and start its server. Auto-detected on `localhost:1234`. Point at a different host with:
+
+```bash
+LMSTUDIO_URL=http://192.168.40.10:1234
+```
+
 ### Mix and Match
 
 All three methods stack. Use API keys for some providers, subscriptions for others, and Ollama for local. They all show up in `list_models` together.
@@ -136,6 +143,7 @@ Route explicitly with prefixes:
 - `google/gemini-2.5-flash` — force Google API
 - `sub/gemini-2.5-flash` — force subscription CLI
 - `ollama/qwen2.5-coder:14b` — force local
+- `lmstudio/<model>` — force LM Studio
 - `gpt-5` — auto-detect (tries each provider)
 
 ## Setup Details
@@ -185,7 +193,7 @@ interface Provider {
 
 See `src/providers/ollama.ts` for a working example. Implement it, register in `src/index.ts`, done.
 
-Providers we'd love to see: LM Studio, OpenRouter, Groq, Together AI, or anything that speaks HTTP.
+Providers we'd love to see: OpenRouter, Groq, Together AI, or anything that speaks HTTP.
 
 ## License
 

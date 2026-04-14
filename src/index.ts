@@ -17,6 +17,7 @@
  *
  *   Local models:
  *     OLLAMA_URL           → Ollama local models (auto-detected)
+ *     LMSTUDIO_URL         → LM Studio (defaults to http://localhost:1234)
  *
  * Set any combination. HydraMCP registers what's available.
  *
@@ -27,6 +28,7 @@
  *   "sub/gemini-2.5-flash"    → Gemini CLI subscription
  *   "sub/claude-..."          → Claude CLI subscription
  *   "ollama/llama3"           → local Ollama instance
+ *   "lmstudio/<model>"        → local/LAN LM Studio instance
  *   "gpt-4o"                  → auto-detect (tries each provider)
  */
 
@@ -36,6 +38,7 @@ import { GoogleProvider } from "./providers/google.js";
 import { AnthropicProvider } from "./providers/anthropic.js";
 import { SubscriptionProvider } from "./providers/subscription.js";
 import { OllamaProvider } from "./providers/ollama.js";
+import { LMStudioProvider } from "./providers/lmstudio.js";
 import { MultiProvider } from "./providers/multi-provider.js";
 import { SmartProvider } from "./orchestrator/index.js";
 import { createServer } from "./server.js";
@@ -90,6 +93,12 @@ async function main() {
     active.push("Ollama");
   }
 
+  const lmstudio = new LMStudioProvider();
+  if (await lmstudio.healthCheck()) {
+    multi.register("lmstudio", lmstudio);
+    active.push("LM Studio");
+  }
+
   // --- Startup summary ---
 
   if (active.length === 0) {
@@ -108,6 +117,7 @@ async function main() {
         "\n" +
         "  Local models:\n" +
         "    Install Ollama → ollama pull llama3\n" +
+        "    LM Studio      → LMSTUDIO_URL=http://host:1234 (default: localhost:1234)\n" +
         "\n" +
         "HydraMCP will start anyway and retry on first request."
     );
